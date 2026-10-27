@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: aikitoria <151776613+aikitoria@users.noreply.github.com>
+Date: Tue, 29 Apr 2025 05:12:28 +0200
+Subject: [PATCH] Enable p2p in the new settings in 575
+
+---
+ src/nvidia/src/kernel/gpu/bif/kernel_bif.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/nvidia/src/kernel/gpu/bif/kernel_bif.c b/src/nvidia/src/kernel/gpu/bif/kernel_bif.c
+index 533c794..fbf37f5 100644
+--- a/src/nvidia/src/kernel/gpu/bif/kernel_bif.c
++++ b/src/nvidia/src/kernel/gpu/bif/kernel_bif.c
+@@ -766,14 +766,14 @@ _kbifInitRegistryOverrides
+     }
+ 
+     // P2P force type override
+-    pKernelBif->forceP2PType = NV_REG_STR_RM_FORCE_P2P_TYPE_BAR1P2P;
++    pKernelBif->forceP2PType = NV_REG_STR_RM_FORCE_P2P_TYPE_PCIEP2P;
+     if (osReadRegistryDword(pGpu, NV_REG_STR_RM_FORCE_P2P_TYPE, &data32) == NV_OK &&
+         (data32 <= NV_REG_STR_RM_FORCE_P2P_TYPE_MAX))
+     {
+         pKernelBif->forceP2PType = data32;
+     }
+ 
+-    pKernelBif->pcieP2PType = NV_REG_STR_RM_PCIEP2P_TYPE_DEFAULT;
++    pKernelBif->pcieP2PType = NV_REG_STR_RM_PCIEP2P_TYPE_BAR1;
+     if (osReadRegistryDword(pGpu, NV_REG_STR_RM_PCIEP2P_TYPE, &data32) == NV_OK)
+     {
+         pKernelBif->pcieP2PType = data32;

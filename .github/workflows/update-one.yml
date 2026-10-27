@@ -1,0 +1,95 @@
+name: update-one
+
+on:
+  workflow_call:
+    inputs:
+      name:
+        description: the update/<name> branch
+        type: string
+        required: true
+      script:
+        description: >-
+          bash run from the repository root; writes the commit title to
+          $TITLE_FILE and may write a body to $BODY_FILE
+        type: string
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.commit.outputs.changed }}
+      sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: cachix/install-nix-action@v31
+      - name: update
+        env:
+          TITLE_FILE: ${{ runner.temp }}/title
+          BODY_FILE: ${{ runner.temp }}/body
+        run: ${{ inputs.script }}
+      - id: commit
+        env:
+          BRANCH: update/${{ inputs.name }}
+          TITLE_FILE: ${{ runner.temp }}/title
+          BODY_FILE: ${{ runner.temp }}/body
+        run: |
+          if git diff --quiet; then
+            echo "changed=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          { cat "$TITLE_FILE"; if [[ -s $BODY_FILE ]]; then echo; cat "$BODY_FILE"; fi; } | git commit -q -F -
+          git push --force origin "HEAD:refs/heads/$BRANCH"
+          echo "changed=true" >>"$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >>"$GITHUB_OUTPUT"
+
+  checks:
+    needs: update
+    if: needs.update.outputs.changed == 'true'
+    uses: ./.github/workflows/checks.yml
+    with:
+      ref: ${{ needs.update.outputs.sha }}
+
+  land:
+    needs: [update, checks]
+    if: always() && needs.update.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.update.outputs.sha }}
+          fetch-depth: 0
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: update/${{ inputs.name }}
+          SHA: ${{ needs.update.outputs.sha }}
+          RESULT: ${{ needs.checks.result }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          pr=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+          if [[ $RESULT == success ]]; then
+            # a fast-forward only: if main moved meanwhile, the next run redoes it
+            git push origin "$SHA:refs/heads/main"
+            if [[ -n $pr ]]; then
+              gh pr close "$pr" --comment "Landed on main as $SHA after green checks ($RUN)." --delete-branch
+            else
+              git push origin --delete "$BRANCH"
+            fi
+          elif [[ -n $pr ]]; then
+            gh pr comment "$pr" --body "Checks failed again at $SHA: $RUN"
+          else
+            gh pr create --head "$BRANCH" --base main \
+              --title "$(git log -1 --format=%s "$SHA")" \
+              --body "$(git log -1 --format=%b "$SHA")
+
+          Checks failed: $RUN (PRs opened by GITHUB_TOKEN run no workflows of their own).  Port on main, see AGENTS.md, then close this PR."
+          fi

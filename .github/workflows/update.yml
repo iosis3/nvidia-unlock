@@ -1,0 +1,36 @@
+name: update
+
+on:
+  schedule:
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+
+concurrency: update
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  flake-inputs:
+    uses: ./.github/workflows/update-one.yml
+    with:
+      name: flake-inputs
+      script: |
+        old=$(jq -r .nodes.nixpkgs.locked.rev flake.lock)
+        nix flake update
+        new=$(jq -r .nodes.nixpkgs.locked.rev flake.lock)
+        echo "flake.lock: update" >"$TITLE_FILE"
+        [[ $old == "$new" ]] || echo "- \`nixpkgs\`: ${old:0:12} -> ${new:0:12}" >"$BODY_FILE"
+
+  nvidia-p2p:
+    needs: flake-inputs
+    if: always()
+    uses: ./.github/workflows/update-one.yml
+    with:
+      name: nvidia-p2p
+      script: |
+        releases() { nix eval --json --file pkgs/nvidia-p2p --apply builtins.attrNames | jq -r 'join(", ")'; }
+        old=$(releases)
+        nix run .#nvidia-patched.updateScript
+        echo "nvidia-p2p: $old -> $(releases)" >"$TITLE_FILE"

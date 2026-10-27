@@ -1,0 +1,1123 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: aikitoria <151776613+aikitoria@users.noreply.github.com>
+Date: Fri, 4 Sep 2026 23:22:24 +0200
+Subject: [PATCH] Accelerate registration of hugepage-backed host memory
+
+---
+ kernel-open/common/inc/nv-linux.h             |  10 ++
+ kernel-open/common/inc/nv.h                   |   2 +
+ kernel-open/nvidia/nv-dma.c                   | 107 +++++++++---
+ kernel-open/nvidia/nv-mmap.c                  |  16 +-
+ kernel-open/nvidia/nv-usermap.c               |   5 +-
+ kernel-open/nvidia/nv.c                       |  53 ++++--
+ kernel-open/nvidia/os-mlock.c                 | 153 ++++++++++++++++--
+ src/nvidia/arch/nvalloc/unix/include/nv.h     |   2 +
+ src/nvidia/arch/nvalloc/unix/src/os.c         |  34 ++--
+ src/nvidia/arch/nvalloc/unix/src/osapi.c      |  10 +-
+ src/nvidia/arch/nvalloc/unix/src/osmemdesc.c  |  96 +++++++----
+ .../arch/maxwell/virt_mem_allocator_gm107.c   |   9 +-
+ src/nvidia/src/kernel/gpu/mem_mgr/mem_desc.c  |  20 ++-
+ 13 files changed, 427 insertions(+), 90 deletions(-)
+
+diff --git a/kernel-open/common/inc/nv-linux.h b/kernel-open/common/inc/nv-linux.h
+index f377db1..10558da 100644
+--- a/kernel-open/common/inc/nv-linux.h
++++ b/kernel-open/common/inc/nv-linux.h
+@@ -933,6 +933,7 @@ typedef struct nv_alloc_s {
+     unsigned int   cache_type;
+     unsigned int   num_pages;
+     unsigned int   order;
++    unsigned int   compound_order;      /* 0 for base pages */
+     unsigned int   size;
+     nvidia_pte_t  *page_table;          /* array of physical pages allocated */
+     unsigned int   pid;
+@@ -945,6 +946,14 @@ typedef struct nv_alloc_s {
+     nv_linux_mm_free_work_t *accounting_mm_work;
+ } nv_alloc_t;
+ 
++static inline NvU64 nv_alloc_page_address(nv_alloc_t *at, NvU64 page_index)
++{
++    NvU64 offset = page_index & ((1ULL << at->compound_order) - 1);
++
++    return at->page_table[page_index >> at->compound_order].phys_addr +
++           (offset << PAGE_SHIFT);
++}
++
+ /**
+  * nv_is_dma_direct - return true if direct_dma is enabled
+  *
+@@ -1065,6 +1074,7 @@ typedef struct nv_dma_map_s {
+     NvBool contiguous;
+     NvU32 cache_type;
+     NvBool bReadOnlyDeviceMap;
++    NvU64 page_granularity;             /* bytes per page array entry */
+     struct sg_table *import_sgt;
+ 
+     union
+diff --git a/kernel-open/common/inc/nv.h b/kernel-open/common/inc/nv.h
+index 2731195..3dd3760 100644
+--- a/kernel-open/common/inc/nv.h
++++ b/kernel-open/common/inc/nv.h
+@@ -977,6 +977,8 @@ NV_STATUS  NV_API_CALL  nv_free_pages            (nv_state_t *, NvU32, NvBool, N
+ 
+ NV_STATUS  NV_API_CALL  nv_register_user_pages   (nv_state_t *, NvU64, NvU64 *, void *, void **, NvBool);
+ void       NV_API_CALL  nv_unregister_user_pages (nv_state_t *, NvU64, void **, void **);
++NvU32      NV_API_CALL  nv_get_compound_order    (void *);
++NvU32      NV_API_CALL  nv_get_page_array_compound_order(void *);
+ 
+ NV_STATUS NV_API_CALL   nv_register_peer_io_mem  (nv_state_t *, NvU64 *, NvU64, void **);
+ void      NV_API_CALL   nv_unregister_peer_io_mem(nv_state_t *, void *);
+diff --git a/kernel-open/nvidia/nv-dma.c b/kernel-open/nvidia/nv-dma.c
+index 8194692..353aa5c 100644
+--- a/kernel-open/nvidia/nv-dma.c
++++ b/kernel-open/nvidia/nv-dma.c
+@@ -82,9 +82,10 @@ static NV_STATUS nv_dma_map_contig(
+ )
+ {
+     enum dma_data_direction direction = nv_dma_get_direction(dma_map);
++    NvU64 mapping_size = dma_map->page_count * dma_map->page_granularity;
+ 
+     *va = dma_map_page_attrs(dma_map->dev, dma_map->pages[0], 0,
+-                             dma_map->page_count * PAGE_SIZE,
++                             mapping_size,
+                              direction,
+                              (dma_map->cache_type == NV_MEMORY_UNCACHED) ?
+                               DMA_ATTR_SKIP_CPU_SYNC : 0);
+@@ -95,12 +96,13 @@ static NV_STATUS nv_dma_map_contig(
+ 
+     dma_map->mapping.contig.dma_addr = *va;
+ 
+-    if (!nv_dma_is_addressable(dma_dev, *va, dma_map->page_count * PAGE_SIZE))
++    if ((*va & (dma_map->page_granularity - 1)) != 0 ||
++        !nv_dma_is_addressable(dma_dev, *va, mapping_size))
+     {
+         NV_DMA_DEV_PRINTF(NV_DBG_ERRORS, dma_dev,
+                 "DMA address not in addressable range of device "
+                 "(0x%llx-0x%llx, 0x%llx-0x%llx)\n",
+-                *va, *va + (dma_map->page_count * PAGE_SIZE - 1),
++                *va, *va + (mapping_size - 1),
+                 dma_dev->addressable_range.start,
+                 dma_dev->addressable_range.limit);
+         nv_dma_unmap_contig(dma_map);
+@@ -113,9 +115,10 @@ static NV_STATUS nv_dma_map_contig(
+ static void nv_dma_unmap_contig(nv_dma_map_t *dma_map)
+ {
+     enum dma_data_direction direction = nv_dma_get_direction(dma_map);
++    NvU64 mapping_size = dma_map->page_count * dma_map->page_granularity;
+ 
+     dma_unmap_page_attrs(dma_map->dev, dma_map->mapping.contig.dma_addr,
+-                         dma_map->page_count * PAGE_SIZE,
++                         mapping_size,
+                          direction,
+                          (dma_map->cache_type == NV_MEMORY_UNCACHED) ?
+                           DMA_ATTR_SKIP_CPU_SYNC : 0);
+@@ -158,13 +161,50 @@ NV_STATUS nv_create_dma_map_scatterlist(nv_dma_map_t *dma_map)
+     nv_dma_submap_t *submap;
+     NvU32 i;
+ 
+-#if defined(NV_SG_ALLOC_TABLE_FROM_PAGES_SEGMENT_PRESENT)
+-    dma_map->mapping.discontig.submap_count = 1;
+-#else
++#if !defined(NV_SG_ALLOC_TABLE_FROM_PAGES_SEGMENT_PRESENT)
+     NvU64 allocated_size = 0;
+     NvU64 num_submaps = dma_map->page_count + NV_DMA_SUBMAP_MAX_PAGES - 1;
+     NvU64 total_size = dma_map->page_count << PAGE_SHIFT;
++#endif
++
++    /* sg_alloc_table_from_pages() expects base pages. */
++    if (dma_map->page_granularity > PAGE_SIZE)
++    {
++        int ret;
++
++        dma_map->mapping.discontig.submap_count = 1;
++
++        status = os_alloc_mem((void **)&dma_map->mapping.discontig.submaps,
++            sizeof(nv_dma_submap_t));
++        if (status != NV_OK)
++            return status;
++
++        os_mem_set(dma_map->mapping.discontig.submaps, 0, sizeof(nv_dma_submap_t));
++
++        submap = &dma_map->mapping.discontig.submaps[0];
++        submap->page_count = dma_map->page_count;
++
++        ret = sg_alloc_table(&submap->sgt, submap->page_count, NV_GFP_KERNEL);
++        if (ret != 0)
++        {
++            os_free_mem(dma_map->mapping.discontig.submaps);
++            return NV_ERR_OPERATING_SYSTEM;
++        }
++
++        {
++            struct scatterlist *sg;
++            unsigned int j;
++
++            for_each_sg(submap->sgt.sgl, sg, submap->page_count, j)
++                sg_set_page(sg, dma_map->pages[j], dma_map->page_granularity, 0);
++        }
++
++        return NV_OK;
++    }
+ 
++#if defined(NV_SG_ALLOC_TABLE_FROM_PAGES_SEGMENT_PRESENT)
++    dma_map->mapping.discontig.submap_count = 1;
++#else
+     /*
+      * This turns into 64-bit division, which the ARMv7 kernel doesn't provide
+      * implicitly. Instead, we need to use the platform's do_div() to perform
+@@ -319,7 +359,7 @@ void nv_destroy_dma_map_scatterlist(nv_dma_map_t *dma_map)
+     os_free_mem(dma_map->mapping.discontig.submaps);
+ }
+ 
+-static void nv_load_dma_map_scatterlist(
++static NV_STATUS nv_load_dma_map_scatterlist(
+     nv_dma_map_t *dma_map,
+     NvU64 *va_array
+ )
+@@ -327,25 +367,31 @@ static void nv_load_dma_map_scatterlist(
+     unsigned int i, j;
+     struct scatterlist *sg;
+     nv_dma_submap_t *submap;
+-    NvU64 sg_addr, sg_off, sg_len, k, l = 0;
++    NvU64 l = 0;
+ 
+     NV_FOR_EACH_DMA_SUBMAP(dma_map, submap, i)
+     {
+         for_each_sg(submap->sgt.sgl, sg, submap->sg_map_count, j)
+         {
+-            /*
+-             * It is possible for pci_map_sg() to merge scatterlist entries, so
+-             * make sure we account for that here.
+-             */
+-            for (sg_addr = sg_dma_address(sg), sg_len = sg_dma_len(sg),
+-                    sg_off = 0, k = 0;
+-                 (sg_off < sg_len) && (k < submap->page_count);
+-                 sg_off += PAGE_SIZE, l++, k++)
++            NvU64 sg_addr = sg_dma_address(sg);
++            NvU64 sg_len = sg_dma_len(sg);
++            NvU64 sg_off;
++
++            if ((sg_addr & (dma_map->page_granularity - 1)) != 0 ||
++                sg_len % dma_map->page_granularity != 0 ||
++                sg_len / dma_map->page_granularity > dma_map->page_count - l)
++                return NV_ERR_INVALID_ADDRESS;
++
++            /* DMA mapping may merge adjacent entries. */
++            for (sg_off = 0; sg_off < sg_len;
++                 sg_off += dma_map->page_granularity, l++)
+             {
+                 va_array[l] = sg_addr + sg_off;
+             }
+         }
+     }
++
++    return l == dma_map->page_count ? NV_OK : NV_ERR_INVALID_ADDRESS;
+ }
+ 
+ static NV_STATUS nv_dma_map_scatterlist(
+@@ -374,11 +420,16 @@ static NV_STATUS nv_dma_map_scatterlist(
+         return status;
+     }
+ 
+-    nv_load_dma_map_scatterlist(dma_map, va_array);
++    status = nv_load_dma_map_scatterlist(dma_map, va_array);
++    if (status != NV_OK)
++    {
++        nv_dma_unmap_scatterlist(dma_map);
++        return status;
++    }
+ 
+     for (i = 0; i < dma_map->page_count; i++)
+     {
+-        if (!nv_dma_is_addressable(dma_dev, va_array[i], PAGE_SIZE))
++        if (!nv_dma_is_addressable(dma_dev, va_array[i], dma_map->page_granularity))
+         {
+             NV_DMA_DEV_PRINTF(NV_DBG_ERRORS, dma_dev,
+                     "DMA address not in addressable range of device "
+@@ -438,6 +489,7 @@ NV_STATUS NV_API_CALL nv_dma_map_sgt(
+     dma_map->contiguous = NV_FALSE;
+     dma_map->cache_type = cache_type;
+     dma_map->bReadOnlyDeviceMap = bReadOnlyDeviceMap;
++    dma_map->page_granularity = PAGE_SIZE;
+ 
+     dma_map->mapping.discontig.submap_count = 0;
+     status = nv_dma_map_scatterlist(dma_dev, dma_map, va_array);
+@@ -483,6 +535,7 @@ static NV_STATUS NV_API_CALL nv_dma_map_pages(
+     NvU64           *va_array,
+     NvBool           contig,
+     NvU32            cache_type,
++    NvU64            page_granularity,
+     NvBool           bReadOnlyDeviceMap,
+     void           **priv
+ )
+@@ -521,6 +574,7 @@ static NV_STATUS NV_API_CALL nv_dma_map_pages(
+     dma_map->contiguous = contig;
+     dma_map->cache_type = cache_type;
+     dma_map->bReadOnlyDeviceMap = bReadOnlyDeviceMap;
++    dma_map->page_granularity = page_granularity;
+ 
+     if (dma_map->page_count > 1 && !dma_map->contiguous)
+     {
+@@ -685,8 +739,17 @@ NV_STATUS NV_API_CALL nv_dma_map_alloc
+     }
+ 
+     *priv = pages;
+-    status = nv_dma_map_pages(dma_dev, page_count, va_array, contig, cache_type,
+-                              bReadOnlyDeviceMap, priv);
++
++    {
++        NvU64 page_granularity = PAGE_SIZE;
++
++        if (at != NULL && at->compound_order > 0)
++            page_granularity = (NvU64)PAGE_SIZE << at->compound_order;
++
++        status = nv_dma_map_pages(dma_dev, page_count, va_array, contig,
++                                  cache_type, page_granularity,
++                                  bReadOnlyDeviceMap, priv);
++    }
+     if (status != NV_OK)
+     {
+         *priv = at;
+@@ -908,7 +971,7 @@ void NV_API_CALL nv_dma_cache_invalidate
+     {
+         dma_sync_single_for_device(dma_dev->dev,
+                                    dma_map->mapping.contig.dma_addr,
+-                                   (size_t) PAGE_SIZE * dma_map->page_count,
++                                   (size_t) dma_map->page_granularity * dma_map->page_count,
+                                    DMA_FROM_DEVICE);
+     }
+     else
+diff --git a/kernel-open/nvidia/nv-mmap.c b/kernel-open/nvidia/nv-mmap.c
+index aa05c9c..16eb63c 100644
+--- a/kernel-open/nvidia/nv-mmap.c
++++ b/kernel-open/nvidia/nv-mmap.c
+@@ -171,14 +171,19 @@ nvidia_vma_access(
+             goto done;
+         }
+ 
+-        if (pageIndex >= at->num_pages)
++        if ((pageIndex >> at->compound_order) >= at->num_pages)
+         {
+             ret = -EINVAL;
+             goto done;
+         }
+ 
+-        pageIndex = nv_array_index_no_speculate(pageIndex, at->num_pages);
+-        kernel_mapping = (void *)(at->page_table[pageIndex].virt_addr + pageOffset);
++        pageIndex = nv_array_index_no_speculate(pageIndex,
++                                               (NvU64)at->num_pages << at->compound_order);
++        if (at->compound_order != 0)
++            kernel_mapping = (NvU8 *)page_address(NV_GET_PAGE_STRUCT(
++                                 nv_alloc_page_address(at, pageIndex))) + pageOffset;
++        else
++            kernel_mapping = (void *)(at->page_table[pageIndex].virt_addr + pageOffset);
+     }
+     else if (has_pages)
+     {
+@@ -472,7 +477,7 @@ static int nvidia_mmap_sysmem(
+                 vma->vm_page_prot = nv_adjust_pgprot(vma->vm_page_prot);
+ 
+             ret = vm_insert_page(vma, start,
+-                                 NV_GET_PAGE_STRUCT(at->page_table[j].phys_addr));
++                                 NV_GET_PAGE_STRUCT(nv_alloc_page_address(at, j)));
+         }
+ 
+         if (ret)
+@@ -681,7 +686,8 @@ int nvidia_mmap_helper(
+         mmap_size = NV_VMA_SIZE(vma);
+         pages = mmap_size >> PAGE_SHIFT;
+ 
+-        if ((page_index + pages) > at->num_pages)
++        if (page_index > ((NvU64)at->num_pages << at->compound_order) ||
++            pages > ((NvU64)at->num_pages << at->compound_order) - page_index)
+         {
+             ret = -ERANGE;
+             goto done;
+diff --git a/kernel-open/nvidia/nv-usermap.c b/kernel-open/nvidia/nv-usermap.c
+index 8245461..e1f9a60 100644
+--- a/kernel-open/nvidia/nv-usermap.c
++++ b/kernel-open/nvidia/nv-usermap.c
+@@ -141,10 +141,13 @@ NV_STATUS NV_API_CALL nv_alloc_user_mapping(
+ {
+     nv_alloc_t *at = pAllocPrivate;
+ 
++    if ((pageIndex >> at->compound_order) >= at->num_pages)
++        return NV_ERR_INVALID_ARGUMENT;
++
+     if (at->flags.contig)
+         *pUserAddress = (at->page_table[0].phys_addr + (pageIndex * PAGE_SIZE) + pageOffset);
+     else
+-        *pUserAddress = (at->page_table[pageIndex].phys_addr + pageOffset);
++        *pUserAddress = nv_alloc_page_address(at, pageIndex) + pageOffset;
+ 
+     return NV_OK;
+ }
+diff --git a/kernel-open/nvidia/nv.c b/kernel-open/nvidia/nv.c
+index df5a5e0..34afa57 100644
+--- a/kernel-open/nvidia/nv.c
++++ b/kernel-open/nvidia/nv.c
+@@ -3598,12 +3598,21 @@ NV_STATUS NV_API_CALL nv_register_user_pages(
+     NvU64 i;
+     struct page **user_pages;
+     nv_linux_state_t *nvl;
++    NvU32 compound_order;
++    NvU64 effective_count;
+ 
+     nv_printf(NV_DBG_MEMINFO, "NVRM: VM: nv_register_user_pages: 0x%" NvU64_fmtx"\n", page_count);
+     user_pages = *priv_data;
+     nvl = NV_GET_NVL_FROM_NV_STATE(nv);
+ 
+-    at = nvos_create_alloc(nvl->dev, page_count);
++    compound_order = nv_get_page_array_compound_order(user_pages);
++
++    if (compound_order > 0)
++        effective_count = page_count >> compound_order;
++    else
++        effective_count = page_count;
++
++    at = nvos_create_alloc(nvl->dev, effective_count);
+ 
+     if (at == NULL)
+     {
+@@ -3624,9 +3633,10 @@ NV_STATUS NV_API_CALL nv_register_user_pages(
+     if (unencrypted)
+         at->flags.unencrypted = NV_TRUE;
+ 
++    at->compound_order = compound_order;
+     at->order = get_order(at->num_pages * PAGE_SIZE);
+ 
+-    for (i = 0; i < page_count; i++)
++    for (i = 0; i < effective_count; i++)
+     {
+         /*
+          * We only assign the physical address and not the DMA address, since
+@@ -3651,6 +3661,23 @@ NV_STATUS NV_API_CALL nv_register_user_pages(
+     return NV_OK;
+ }
+ 
++NvU32 NV_API_CALL nv_get_compound_order(
++    void *priv_data
++)
++{
++    nv_alloc_t *at = priv_data;
++    return at->compound_order;
++}
++
++/* Matches nv_page_array_header_t in os-mlock.c. */
++NvU32 NV_API_CALL nv_get_page_array_compound_order(
++    void *page_array
++)
++{
++    NvU64 *header = (NvU64 *)((NvU8 *)page_array - 2 * sizeof(NvU64));
++    return (NvU32)header[1];
++}
++
+ void NV_API_CALL nv_unregister_user_pages(
+     nv_state_t *nv,
+     NvU64       page_count,
+@@ -3878,12 +3905,13 @@ NV_STATUS NV_API_CALL nv_get_num_phys_pages(
+ )
+ {
+     nv_alloc_t *at = pAllocPrivate;
++    NvU64 page_count = (NvU64)at->num_pages << at->compound_order;
+ 
+-    if (!pNumPages) {
++    if (!pNumPages || page_count > NV_U32_MAX) {
+         return NV_ERR_INVALID_ARGUMENT;
+     }
+ 
+-    *pNumPages = at->num_pages;
++    *pNumPages = page_count;
+ 
+     return NV_OK;
+ }
+@@ -3897,16 +3925,16 @@ NV_STATUS NV_API_CALL nv_get_phys_pages(
+     nv_alloc_t *at = pAllocPrivate;
+     struct page **pages = (struct page **)pPages;
+     NvU32 page_count;
+-    int i;
++    NvU32 i;
+ 
+     if (!pNumPages || !pPages) {
+         return NV_ERR_INVALID_ARGUMENT;
+     }
+ 
+-    page_count = NV_MIN(*pNumPages, at->num_pages);
++    page_count = NV_MIN(*pNumPages, (NvU64)at->num_pages << at->compound_order);
+ 
+     for (i = 0; i < page_count; i++) {
+-        pages[i] = NV_GET_PAGE_STRUCT(at->page_table[i].phys_addr);
++        pages[i] = NV_GET_PAGE_STRUCT(nv_alloc_page_address(at, i));
+     }
+ 
+     *pNumPages = page_count;
+@@ -3938,6 +3966,11 @@ void* NV_API_CALL nv_alloc_kernel_mapping(
+     NvUPtr virt_addr;
+     struct page **pages;
+     NvBool isUserAllocatedMem;
++    NvU64 num_pages = (NvU64)at->num_pages << at->compound_order;
++
++    if (pageIndex >= num_pages || pageOffset >= PAGE_SIZE ||
++        size > ((num_pages - pageIndex) << PAGE_SHIFT) - pageOffset)
++        return NULL;
+ 
+     //
+     // For User allocated memory (like ErrorNotifier's) which is NOT allocated
+@@ -3947,8 +3980,8 @@ void* NV_API_CALL nv_alloc_kernel_mapping(
+     // those pages to obtain virtual address.
+     //
+     isUserAllocatedMem = at->flags.user &&
+-                        !at->page_table[pageIndex].virt_addr &&
+-                         at->page_table[pageIndex].phys_addr;
++                        !at->page_table[pageIndex >> at->compound_order].virt_addr &&
++                         at->page_table[pageIndex >> at->compound_order].phys_addr;
+ 
+     //
+     // User memory may NOT have kernel VA. So check this and fallback to else
+@@ -3984,7 +4017,7 @@ void* NV_API_CALL nv_alloc_kernel_mapping(
+             }
+ 
+             for (j = 0; j < page_count; j++)
+-                pages[j] = NV_GET_PAGE_STRUCT(at->page_table[pageIndex+j].phys_addr);
++                pages[j] = NV_GET_PAGE_STRUCT(nv_alloc_page_address(at, pageIndex + j));
+ 
+             virt_addr = nv_vm_map_pages(pages, page_count,
+                 at->cache_type == NV_MEMORY_CACHED, at->flags.unencrypted);
+diff --git a/kernel-open/nvidia/os-mlock.c b/kernel-open/nvidia/os-mlock.c
+index e32b9b7..96b77e6 100644
+--- a/kernel-open/nvidia/os-mlock.c
++++ b/kernel-open/nvidia/os-mlock.c
+@@ -25,6 +25,7 @@
+ 
+ #include "os-interface.h"
+ #include "nv-linux.h"
++#include <linux/hugetlb.h>
+ 
+ #if defined(NVCPU_FAMILY_X86) && defined(NV_FOLL_LONGTERM_PRESENT) && \
+     (defined(NV_PIN_USER_PAGES_HAS_ARGS_VMAS) ||                      \
+@@ -213,6 +214,86 @@ done:
+     return rmStatus;
+ }
+ 
++/* Stored immediately before the returned page array. */
++typedef struct {
++    NvU64 num_entries;
++    NvU64 compound_order;
++} nv_page_array_header_t;
++
++#define NV_PAGE_ARRAY_HEADER_SIZE sizeof(nv_page_array_header_t)
++
++static inline nv_page_array_header_t *nv_page_array_header(struct page **pages)
++{
++    return (nv_page_array_header_t *)((NvU8 *)pages - NV_PAGE_ARRAY_HEADER_SIZE);
++}
++
++static NV_STATUS nv_alloc_page_array(
++    NvU64 num_entries,
++    NvU32 compound_order,
++    struct page ***out_pages
++)
++{
++    NV_STATUS status;
++    NvU8 *raw;
++    nv_page_array_header_t *header;
++
++    status = os_alloc_mem((void **)&raw,
++            NV_PAGE_ARRAY_HEADER_SIZE + num_entries * sizeof(struct page *));
++    if (status != NV_OK)
++        return status;
++
++    header = (nv_page_array_header_t *)raw;
++    header->num_entries = num_entries;
++    header->compound_order = compound_order;
++
++    *out_pages = (struct page **)(raw + NV_PAGE_ARRAY_HEADER_SIZE);
++    return NV_OK;
++}
++
++static void nv_free_page_array(struct page **pages)
++{
++    os_free_mem((NvU8 *)pages - NV_PAGE_ARRAY_HEADER_SIZE);
++}
++
++static NvBool nv_hugetlb_fast_path_eligible(
++    struct vm_area_struct *vma,
++    unsigned long start,
++    NvU64 page_count,
++    unsigned long *hpage_size_out,
++    unsigned int *compound_order_out
++)
++{
++    NvU64 range_size;
++    unsigned long end;
++    unsigned long hpage_size;
++
++    if (!vma || start < vma->vm_start ||
++        !is_vm_hugetlb_page(vma) || page_count == 0)
++        return NV_FALSE;
++
++    if (page_count > ((NvU64)ULONG_MAX / PAGE_SIZE))
++        return NV_FALSE;
++
++    range_size = page_count * PAGE_SIZE;
++    if (start > ULONG_MAX - range_size)
++        return NV_FALSE;
++
++    end = start + range_size;
++    hpage_size = huge_page_size(hstate_vma(vma));
++
++    if (hpage_size <= PAGE_SIZE || hpage_size > NV_U32_MAX ||
++        (start & (hpage_size - 1)) != 0 ||
++        (range_size & (hpage_size - 1)) != 0 ||
++        end > vma->vm_end)
++    {
++        return NV_FALSE;
++    }
++
++    *hpage_size_out = hpage_size;
++    *compound_order_out = ilog2(hpage_size / PAGE_SIZE);
++    return NV_TRUE;
++}
++
+ NV_STATUS NV_API_CALL os_lock_user_pages(
+     void   *address,
+     NvU64   page_count,
+@@ -223,8 +304,7 @@ NV_STATUS NV_API_CALL os_lock_user_pages(
+     NV_STATUS rmStatus;
+     struct mm_struct *mm = current->mm;
+     struct page **user_pages;
+-    NvU64 i;
+-    NvU64 npages = page_count;
++    NvU64 i, j;
+     NvU64 pinned = 0;
+     unsigned int gup_flags = DRF_VAL(_LOCK_USER_PAGES, _FLAGS, _WRITE, flags) ? FOLL_WRITE : 0;
+     long ret;
+@@ -240,18 +320,66 @@ NV_STATUS NV_API_CALL os_lock_user_pages(
+         return NV_ERR_NOT_SUPPORTED;
+     }
+ 
+-    rmStatus = os_alloc_mem((void **)&user_pages,
+-            (page_count * sizeof(*user_pages)));
++    nv_mmap_read_lock(mm);
++
++    /* One pin holds the entire hugetlb page. */
++    {
++        unsigned long start = (unsigned long)address;
++        struct vm_area_struct *vma = find_vma(mm, start);
++        unsigned long hpage_size;
++        unsigned int order;
++
++        if (nv_hugetlb_fast_path_eligible(vma,
++                                          start,
++                                          page_count,
++                                          &hpage_size,
++                                          &order))
++        {
++            NvU64 num_hugepages = page_count >> order;
++
++            rmStatus = nv_alloc_page_array(num_hugepages, order, &user_pages);
++            if (rmStatus != NV_OK)
++            {
++                nv_mmap_read_unlock(mm);
++                nv_printf(NV_DBG_ERRORS,
++                        "NVRM: failed to allocate hugepage table!\n");
++                return rmStatus;
++            }
++
++            for (i = 0; i < num_hugepages; i++)
++            {
++                ret = NV_PIN_USER_PAGES(start + i * hpage_size,
++                                        1,
++                                        gup_flags,
++                                        &user_pages[i]);
++                if (ret != 1)
++                {
++                    for (j = 0; j < i; j++)
++                        NV_UNPIN_USER_PAGE(user_pages[j]);
++                    nv_free_page_array(user_pages);
++                    nv_mmap_read_unlock(mm);
++                    return NV_ERR_INVALID_ADDRESS;
++                }
++            }
++
++            nv_mmap_read_unlock(mm);
++
++            *page_array = user_pages;
++            return NV_OK;
++        }
++    }
++
++    rmStatus = nv_alloc_page_array(page_count, 0, &user_pages);
+     if (rmStatus != NV_OK)
+     {
++        nv_mmap_read_unlock(mm);
+         nv_printf(NV_DBG_ERRORS,
+                 "NVRM: failed to allocate page table!\n");
+         return rmStatus;
+     }
+ 
+-    nv_mmap_read_lock(mm);
+     ret = NV_PIN_USER_PAGES((unsigned long)address,
+-                            npages, gup_flags, user_pages);
++                            page_count, gup_flags, user_pages);
+     if (ret > 0)
+     {
+         pinned = ret;
+@@ -276,6 +404,8 @@ NV_STATUS NV_API_CALL os_lock_user_pages(
+     else if ((ret == -ENOMEM) &&
+              (page_count > NV_NUM_PIN_PAGES_PER_ITERATION))
+     {
++        NvU64 npages;
++
+         for (pinned = 0; pinned < page_count; pinned += ret)
+         {
+             npages = page_count - pinned;
+@@ -299,7 +429,7 @@ NV_STATUS NV_API_CALL os_lock_user_pages(
+     {
+         for (i = 0; i < pinned; i++)
+             NV_UNPIN_USER_PAGE(user_pages[i]);
+-        os_free_mem(user_pages);
++        nv_free_page_array(user_pages);
+         return NV_ERR_INVALID_ADDRESS;
+     }
+ 
+@@ -316,16 +446,19 @@ NV_STATUS NV_API_CALL os_unlock_user_pages(
+ {
+     NvBool write = FLD_TEST_DRF(_LOCK_USER_PAGES, _FLAGS, _WRITE, _YES, flags);
+     struct page **user_pages = page_array;
+-    NvU32 i;
++    nv_page_array_header_t *header = nv_page_array_header(user_pages);
++    NvU64 num_entries = header->num_entries;
++    NvU64 i;
+ 
+-    for (i = 0; i < page_count; i++)
++    for (i = 0; i < num_entries; i++)
+     {
+         if (write)
+             set_page_dirty_lock(user_pages[i]);
++
+         NV_UNPIN_USER_PAGE(user_pages[i]);
+     }
+ 
+-    os_free_mem(user_pages);
++    nv_free_page_array(user_pages);
+ 
+     return NV_OK;
+ }
+diff --git a/src/nvidia/arch/nvalloc/unix/include/nv.h b/src/nvidia/arch/nvalloc/unix/include/nv.h
+index ba72129..bf5e89e 100644
+--- a/src/nvidia/arch/nvalloc/unix/include/nv.h
++++ b/src/nvidia/arch/nvalloc/unix/include/nv.h
+@@ -977,6 +977,8 @@ NV_STATUS  NV_API_CALL  nv_free_pages            (nv_state_t *, NvU32, NvBool, N
+ 
+ NV_STATUS  NV_API_CALL  nv_register_user_pages   (nv_state_t *, NvU64, NvU64 *, void *, void **, NvBool);
+ void       NV_API_CALL  nv_unregister_user_pages (nv_state_t *, NvU64, void **, void **);
++NvU32      NV_API_CALL  nv_get_compound_order    (void *);
++NvU32      NV_API_CALL  nv_get_page_array_compound_order(void *);
+ 
+ NV_STATUS NV_API_CALL   nv_register_peer_io_mem  (nv_state_t *, NvU64 *, NvU64, void **);
+ void      NV_API_CALL   nv_unregister_peer_io_mem(nv_state_t *, void *);
+diff --git a/src/nvidia/arch/nvalloc/unix/src/os.c b/src/nvidia/arch/nvalloc/unix/src/os.c
+index faa5e25..3838596 100644
+--- a/src/nvidia/arch/nvalloc/unix/src/os.c
++++ b/src/nvidia/arch/nvalloc/unix/src/os.c
+@@ -3830,6 +3830,7 @@ osIovaMap
+     NvBool bIsContig;
+     NV_ADDRESS_SPACE addressSpace;
+     NvU32 osPageCount;
++    NvBool bHugePages;
+ 
+     if (pIovaMapping == NULL)
+     {
+@@ -3875,7 +3876,13 @@ osIovaMap
+     }
+ 
+     nv = NV_GET_NV_STATE(pGpu);
+-    if (IS_DISCONTIG_AND_DYNGRAN_ENABLED(pIovaMapping->pPhysMemDesc))
++    bHugePages = memdescGetFlag(pIovaMapping->pPhysMemDesc, MEMDESC_FLAGS_EXT_PAGE_ARRAY_MEM) &&
++                pIovaMapping->pPhysMemDesc->pageArrayGranularity > os_page_size;
++    if (bHugePages)
++    {
++        osPageCount = pIovaMapping->pPhysMemDesc->PageCount;
++    }
++    else if (IS_DISCONTIG_AND_DYNGRAN_ENABLED(pIovaMapping->pPhysMemDesc))
+     {
+         osPageCount = pIovaMapping->pPhysMemDesc->PageCount;
+         NV_ASSERT_OR_RETURN(os_page_size == pIovaMapping->pPhysMemDesc->pageArrayGranularity, NV_ERR_INVALID_PARAMETER);
+@@ -3916,11 +3923,11 @@ osIovaMap
+     //
+     peer = NV_GET_NV_STATE(pRootMemDesc->pGpu);
+     bIsContig = memdescGetContiguity(pIovaMapping->pPhysMemDesc, AT_CPU);
+-    if (IS_DISCONTIG_AND_DYNGRAN_ENABLED(pIovaMapping->pPhysMemDesc))
++    if (!bHugePages && IS_DISCONTIG_AND_DYNGRAN_ENABLED(pIovaMapping->pPhysMemDesc))
+     {
+         NV_ASSERT_OR_RETURN(pIovaMapping->pPhysMemDesc->pageArrayGranularity == os_page_size, NV_ERR_INVALID_ARGUMENT);
+     }
+-    else if (NV_RM_PAGE_SIZE < os_page_size && !bIsContig)
++    else if (!bHugePages && NV_RM_PAGE_SIZE < os_page_size && !bIsContig)
+     {
+         RmDeflateRmToOsPageArray(&pIovaMapping->iovaArray[0],
+                                 pIovaMapping->pPhysMemDesc->PageCount);
+@@ -4013,11 +4020,11 @@ osIovaMap
+     // If the OS layer doesn't think in RM page size, we need to inflate the
+     // PTE array into RM pages.
+     //
+-    if (IS_DISCONTIG_AND_DYNGRAN_ENABLED(pIovaMapping->pPhysMemDesc))
++    if (!bHugePages && IS_DISCONTIG_AND_DYNGRAN_ENABLED(pIovaMapping->pPhysMemDesc))
+     {
+         NV_ASSERT_OR_RETURN(pIovaMapping->pPhysMemDesc->pageArrayGranularity == os_page_size, NV_ERR_INVALID_ARGUMENT);
+     }
+-    else if (NV_RM_PAGE_SIZE < os_page_size && !bIsContig)
++    else if (!bHugePages && NV_RM_PAGE_SIZE < os_page_size && !bIsContig)
+     {
+         RmInflateOsToRmPageArray(&pIovaMapping->iovaArray[0],
+                                 pIovaMapping->pPhysMemDesc->PageCount);
+@@ -4045,6 +4052,7 @@ osIovaUnmap
+     void *pPriv;
+     NV_STATUS status;
+     NvU64 osPageCount;
++    NvBool bHugePages;
+ 
+     if (pIovaMapping == NULL)
+     {
+@@ -4073,7 +4081,13 @@ osIovaUnmap
+     {
+         return;
+     }
+-    if (IS_DISCONTIG_AND_DYNGRAN_ENABLED(pIovaMapping->pPhysMemDesc))
++    bHugePages = memdescGetFlag(pIovaMapping->pPhysMemDesc, MEMDESC_FLAGS_EXT_PAGE_ARRAY_MEM) &&
++                pIovaMapping->pPhysMemDesc->pageArrayGranularity > os_page_size;
++    if (bHugePages)
++    {
++        osPageCount = pIovaMapping->pPhysMemDesc->PageCount;
++    }
++    else if (IS_DISCONTIG_AND_DYNGRAN_ENABLED(pIovaMapping->pPhysMemDesc))
+     {
+         osPageCount = pIovaMapping->pPhysMemDesc->PageCount;
+         NV_ASSERT(os_page_size == pIovaMapping->pPhysMemDesc->pageArrayGranularity);
+@@ -4098,11 +4112,11 @@ osIovaUnmap
+     //
+     pPriv = (void *)pIovaMapping->pOsData;
+ 
+-    if (IS_DISCONTIG_AND_DYNGRAN_ENABLED(pIovaMapping->pPhysMemDesc))
++    if (!bHugePages && IS_DISCONTIG_AND_DYNGRAN_ENABLED(pIovaMapping->pPhysMemDesc))
+     {
+         NV_ASSERT(pIovaMapping->pPhysMemDesc->pageArrayGranularity == os_page_size);
+     }
+-    else if (NV_RM_PAGE_SIZE < os_page_size &&
++    else if (!bHugePages && NV_RM_PAGE_SIZE < os_page_size &&
+             !memdescGetContiguity(pIovaMapping->pPhysMemDesc, AT_CPU))
+     {
+         RmDeflateRmToOsPageArray(&pIovaMapping->iovaArray[0],
+@@ -4132,11 +4146,11 @@ osIovaUnmap
+     // If the OS layer doesn't think in RM page size, we need to fluff out the
+     // PTE array into RM pages.
+     //
+-    if (IS_DISCONTIG_AND_DYNGRAN_ENABLED(pIovaMapping->pPhysMemDesc))
++    if (!bHugePages && IS_DISCONTIG_AND_DYNGRAN_ENABLED(pIovaMapping->pPhysMemDesc))
+     {
+         NV_ASSERT(pIovaMapping->pPhysMemDesc->pageArrayGranularity == os_page_size);
+     }
+-    else if (NV_RM_PAGE_SIZE < os_page_size &&
++    else if (!bHugePages && NV_RM_PAGE_SIZE < os_page_size &&
+             !memdescGetContiguity(pIovaMapping->pPhysMemDesc, AT_CPU))
+     {
+         RmInflateOsToRmPageArray(&pIovaMapping->iovaArray[0],
+diff --git a/src/nvidia/arch/nvalloc/unix/src/osapi.c b/src/nvidia/arch/nvalloc/unix/src/osapi.c
+index 22c4ede..47a6788 100644
+--- a/src/nvidia/arch/nvalloc/unix/src/osapi.c
++++ b/src/nvidia/arch/nvalloc/unix/src/osapi.c
+@@ -2378,7 +2378,15 @@ static NV_STATUS RmGetMmapPteArray(
+         return status;
+     }
+ 
+-    if (!nvuap->contig)
++    if (!nvuap->contig &&
++        memdescGetFlag(pMemDesc, MEMDESC_FLAGS_EXT_PAGE_ARRAY_MEM) &&
++        pMemDesc->pageArrayGranularity > NV_RM_PAGE_SIZE)
++    {
++        pages = nvuap->memArea.pRanges[0].size / os_page_size;
++        memdescGetPhysAddrs(pMemDesc, AT_CPU, nvuap->offset,
++                           os_page_size, pages, nvuap->page_array);
++    }
++    else if (!nvuap->contig)
+     {
+         pteArray = memdescGetPteArray(pMemDesc, AT_CPU);
+         if (IS_DISCONTIG_AND_DYNGRAN_ENABLED(pMemDesc))
+diff --git a/src/nvidia/arch/nvalloc/unix/src/osmemdesc.c b/src/nvidia/arch/nvalloc/unix/src/osmemdesc.c
+index 43524f0..9f9b96c 100644
+--- a/src/nvidia/arch/nvalloc/unix/src/osmemdesc.c
++++ b/src/nvidia/arch/nvalloc/unix/src/osmemdesc.c
+@@ -190,6 +190,8 @@ osCreateMemdescFromPages
+     NvU32 gpuCachedFlags;
+     NvBool bUnprotected = NV_FALSE;
+     NvU64 osPageCount;
++    NvU32 compoundOrder;
++    NvU64 memdescSize;
+ 
+     //
+     // Align size up to os page size. This is important in
+@@ -201,6 +203,20 @@ osCreateMemdescFromPages
+ 
+     osPageCount = size >> os_page_shift;
+ 
++    // Size the PTE array by hugepage count.
++    compoundOrder = nv_get_page_array_compound_order(*ppPrivate);
++
++    if (compoundOrder > 0)
++    {
++        NvU64 hugepageCount = size >> (os_page_shift + compoundOrder);
++
++        memdescSize = hugepageCount * NV_RM_PAGE_SIZE;
++    }
++    else
++    {
++        memdescSize = size;
++    }
++
+     if (FLD_TEST_DRF(OS02, _FLAGS, _ALLOC_NISO_DISPLAY, _YES, flags))
+     {
+         memdescFlags |= MEMDESC_FLAGS_MEMORY_TYPE_DISPLAY_NISO;
+@@ -223,7 +239,7 @@ osCreateMemdescFromPages
+         memdescFlags |= MEMDESC_FLAGS_DEVICE_READ_ONLY;
+     }
+ 
+-    rmStatus = memdescCreate(ppMemDesc, pGpu, size, 0,
++    rmStatus = memdescCreate(ppMemDesc, pGpu, memdescSize, 0,
+                              NV_MEMORY_NONCONTIGUOUS, ADDR_SYSMEM,
+                              cacheType, memdescFlags);
+     if (rmStatus != NV_OK)
+@@ -231,12 +247,19 @@ osCreateMemdescFromPages
+         return rmStatus;
+     }
+ 
++    pMemDesc = *ppMemDesc;
++
++    // Restore the buffer size.
++    if (compoundOrder > 0)
++    {
++        pMemDesc->Size = size;
++    }
++
+     if (FLD_TEST_DRF(OS02, _FLAGS, _GPU_CACHEABLE, _YES, flags))
+         gpuCachedFlags = NV_MEMORY_CACHED;
+     else
+         gpuCachedFlags = NV_MEMORY_UNCACHED;
+ 
+-    pMemDesc = *ppMemDesc;
+     rmStatus = nv_register_user_pages(NV_GET_NV_STATE(pGpu),
+             osPageCount,
+             memdescGetPteArray(pMemDesc, AT_CPU), pImportPriv,
+@@ -251,7 +274,18 @@ osCreateMemdescFromPages
+     memdescSetFlag(pMemDesc, MEMDESC_FLAGS_KERNEL_MODE, NV_FALSE);
+     memdescSetFlag(pMemDesc, MEMDESC_FLAGS_EXT_PAGE_ARRAY_MEM, NV_TRUE);
+ 
+-    if (IS_DISCONTIG_AND_DYNGRAN_ENABLED(pMemDesc))
++    if (compoundOrder > 0)
++    {
++        NvU64 hugepageGranularity = (NvU64)os_page_size << compoundOrder;
++
++        NV_ASSERT_OK_OR_GOTO(rmStatus,
++            memdescSetAllocSizeFields(pMemDesc, size, (NvU32)hugepageGranularity),
++            cleanup);
++
++        // UVM selects a supported GPU page size.
++        memdescSetPageSize(pMemDesc, AT_GPU, hugepageGranularity);
++    }
++    else if (IS_DISCONTIG_AND_DYNGRAN_ENABLED(pMemDesc))
+     {
+         NV_ASSERT_OR_GOTO((os_page_size & (pMemDesc->pageArrayGranularity - 1ULL)) == 0, cleanup);
+         NV_ASSERT_OK_OR_GOTO(rmStatus, memdescSetAllocSizeFields(pMemDesc, size, os_page_size), cleanup);
+@@ -268,11 +302,12 @@ osCreateMemdescFromPages
+     }
+ 
+ 
+-    //
+-    // If the OS layer doesn't think in RM page size, we need to inflate the
+-    // PTE array into RM pages.
+-    //
+-    if (IS_DISCONTIG_AND_DYNGRAN_ENABLED(pMemDesc))
++    // Inflate base-page arrays to RM pages.
++    if (compoundOrder > 0)
++    {
++        // No conversion needed.
++    }
++    else if (IS_DISCONTIG_AND_DYNGRAN_ENABLED(pMemDesc))
+     {
+         // Because os_page_size == pMemDesc->pageArrayGranularity, we don't need to do any page array conversion.
+         NV_ASSERT_OR_ELSE(os_page_size == pMemDesc->pageArrayGranularity, rmStatus = NV_ERR_INVALID_ARGUMENT; goto cleanup);
+@@ -294,10 +329,15 @@ osCreateMemdescFromPages
+     memdescSetMemData(pMemDesc, *ppPrivate, NULL);
+ 
+     rmStatus = memdescMapIommu(pMemDesc, pGpu->busInfo.iovaspaceId);
++
+ cleanup:
+     if (rmStatus != NV_OK)
+     {
+-        if (IS_DISCONTIG_AND_DYNGRAN_ENABLED(pMemDesc))
++        if (compoundOrder > 0)
++        {
++            // No conversion needed.
++        }
++        else if (IS_DISCONTIG_AND_DYNGRAN_ENABLED(pMemDesc))
+         {
+             // Because os_page_size == pMemDesc->pageArrayGranularity, we don't need to do any page array conversion.
+             NV_ASSERT(os_page_size == pMemDesc->pageArrayGranularity);
+@@ -1187,15 +1227,23 @@ osDestroyOsDescriptorPageArray
+     MEMORY_DESCRIPTOR *pMemDesc
+ )
+ {
+-    OBJGPU   *pGpu        = pMemDesc->pGpu;
+-    NvU64     osPageCount;
++    OBJGPU   *pGpu = pMemDesc->pGpu;
+     NV_STATUS status;
+     void     *pPrivate;
++    NvU32     compoundOrder;
++    NvU64     osPageCount;
+ 
+     pPrivate = memdescGetMemData(pMemDesc);
+ 
+     NV_ASSERT(pPrivate != NULL);
+ 
++    compoundOrder = nv_get_compound_order(pPrivate);
++
++    if (compoundOrder > 0 || IS_DISCONTIG_AND_DYNGRAN_ENABLED(pMemDesc))
++        osPageCount = pMemDesc->PageCount;
++    else
++        osPageCount = NV_RM_PAGES_TO_OS_PAGES(pMemDesc->PageCount);
++
+     //
+     // TODO: Bug 1811006: Notably skip any IOMMU mapping management as the
+     // pMemDesc->pGpu might have been torn down already and the pGpu passed in
+@@ -1205,21 +1253,21 @@ osDestroyOsDescriptorPageArray
+     // be cleaned up once the fix for bug 1811006 is known.
+     //
+ 
+-    if (IS_DISCONTIG_AND_DYNGRAN_ENABLED(pMemDesc))
++    // Deflate base-page arrays to OS pages.
++    if (compoundOrder > 0)
++    {
++        // No conversion needed.
++    }
++    else if (IS_DISCONTIG_AND_DYNGRAN_ENABLED(pMemDesc))
+     {
+         // Because os_page_size == pMemDesc->pageArrayGranularity, we don't need to do any page array conversion.
+         NV_ASSERT_OR_RETURN_VOID(os_page_size == pMemDesc->pageArrayGranularity);
+-        osPageCount = pMemDesc->PageCount;
+     }
+-    else
+-    {
+-        osPageCount = NV_RM_PAGES_TO_OS_PAGES(pMemDesc->PageCount);
+-        if ((NV_RM_PAGE_SIZE < os_page_size) &&
++    else if ((NV_RM_PAGE_SIZE < os_page_size) &&
+             !memdescGetContiguity(pMemDesc, AT_CPU))
+-        {
+-            RmDeflateRmToOsPageArray(memdescGetPteArray(pMemDesc, AT_CPU),
+-                                    pMemDesc->PageCount);
+-        }
++    {
++        RmDeflateRmToOsPageArray(memdescGetPteArray(pMemDesc, AT_CPU),
++                                pMemDesc->PageCount);
+     }
+ 
+     nv_unregister_user_pages(NV_GET_NV_STATE(pGpu), osPageCount,
+@@ -1231,12 +1279,6 @@ osDestroyOsDescriptorPageArray
+     }
+     else
+     {
+-        //
+-        // We use MEMDESC_FLAGS_USER_READ_ONLY because this reflects the
+-        // NVOS02_FLAGS_ALLOC_USER_READ_ONLY flag value passed into
+-        // os_lock_user_pages(). That flag also results in
+-        // MEMDESC_FLAGS_DEVICE_READ_ONLY being set.
+-        //
+         NvBool writable = !memdescGetFlag(pMemDesc, MEMDESC_FLAGS_USER_READ_ONLY);
+         NvU32 flags = DRF_NUM(_LOCK_USER_PAGES, _FLAGS, _WRITE, writable);
+         status = os_unlock_user_pages(osPageCount, pPrivate, flags);
+diff --git a/src/nvidia/src/kernel/gpu/mem_mgr/arch/maxwell/virt_mem_allocator_gm107.c b/src/nvidia/src/kernel/gpu/mem_mgr/arch/maxwell/virt_mem_allocator_gm107.c
+index 9d16c9b..eee66d2 100644
+--- a/src/nvidia/src/kernel/gpu/mem_mgr/arch/maxwell/virt_mem_allocator_gm107.c
++++ b/src/nvidia/src/kernel/gpu/mem_mgr/arch/maxwell/virt_mem_allocator_gm107.c
+@@ -1831,6 +1831,8 @@ _gmmuWalkCBMapNextEntries_Direct
+             {
+                 pIter->physAddr = dmaPageArrayGetPhysAddr(pIter->pPageArray, currIdxMod);
+ 
++                if (pageSize < pTarget->pageArrayGranularity)
++                    pIter->physAddr -= pIter->pPageArray->PteAdjust;
+                 pIter->physAddr += pIter->currPageOffset;
+                 // Hack to WAR submemesc mappings
+                 pIter->physAddr = NV_ALIGN_DOWN64(pIter->physAddr, pageSize);
+@@ -1961,7 +1963,7 @@ _gmmuWalkCBMapNextEntries_Direct
+         // pPageArray deals pages with granularity `pTarget->pageArrayGranularity`.
+         // So increment by the ratio of mapping page size to `pTarget->pageArrayGranularity`
+         //
+-        if (SYS_GET_INSTANCE()->bEnableDynamicGranularityPageArrays && pageSize < pTarget->pageArrayGranularity)
++        if (pageSize < pTarget->pageArrayGranularity)
+         {
+             pIter->currPageOffset += pageSize;
+             if (pIter->currPageOffset >= pTarget->pageArrayGranularity)
+@@ -2254,7 +2256,8 @@ dmaUpdateVASpace_GF100
+     // encounter a case where a larger page granularity physical surface gets
+     // represented by a smaller granularity pageArray.
+     //
+-    if (!SYS_GET_INSTANCE()->bEnableDynamicGranularityPageArrays)
++    if (!SYS_GET_INSTANCE()->bEnableDynamicGranularityPageArrays &&
++        (pMemDesc == NULL || pageSize > pMemDesc->pageArrayGranularity))
+     {
+         //
+         // VMM-TODO: Merge into PL1 traveral.
+@@ -2362,6 +2365,8 @@ dmaUpdateVASpace_GF100
+         //MMU_MAP_ITER
+         mapIter.pFmt            = pFmt;
+         mapIter.pPageArray      = pPageArray;
++        if (pageSize < pMemDesc->pageArrayGranularity && pPageArray != NULL)
++            mapIter.currPageOffset = pPageArray->PteAdjust;
+         mapIter.surfaceOffset   = surfaceOffset;
+         mapIter.comprInfo       = *pComprInfo;
+         mapIter.bReadPtes       = readPte;
+diff --git a/src/nvidia/src/kernel/gpu/mem_mgr/mem_desc.c b/src/nvidia/src/kernel/gpu/mem_mgr/mem_desc.c
+index 41007bf..f504727 100644
+--- a/src/nvidia/src/kernel/gpu/mem_mgr/mem_desc.c
++++ b/src/nvidia/src/kernel/gpu/mem_mgr/mem_desc.c
+@@ -2532,6 +2532,10 @@ memdescCreateSubMem
+     MEMORY_DESCRIPTOR *pLast;
+     MEMORY_DESCRIPTOR *pNew;
+     OBJGPU *pGpuChild;
++    NvU64 descriptorSize = Size;
++    NvBool bNativePageArray =
++        memdescGetFlag(pMemDesc, MEMDESC_FLAGS_EXT_PAGE_ARRAY_MEM) &&
++        pMemDesc->pageArrayGranularity > RM_PAGE_SIZE;
+ 
+     NV_ASSERT_OR_RETURN(Offset < pMemDesc->Size, NV_ERR_INVALID_ARGUMENT);
+     NV_ASSERT_OR_RETURN(Size != 0, NV_ERR_INVALID_ARGUMENT);
+@@ -2543,8 +2547,16 @@ memdescCreateSubMem
+         pGpu = pMemDesc->pGpu;
+     }
+ 
++    if (bNativePageArray)
++    {
++        NvU64 granularity = pMemDesc->pageArrayGranularity;
++        NvU64 adjust = (pMemDesc->PteAdjust + Offset) & (granularity - 1);
++
++        descriptorSize = (NV_ALIGN_UP64(adjust + Size, granularity) / granularity) * RM_PAGE_SIZE;
++    }
++
+     // Allocate the new MEMORY_DESCRIPTOR
+-    status = memdescCreate(&pMemDescNew, pGpu, Size, 0,
++    status = memdescCreate(&pMemDescNew, pGpu, descriptorSize, 0,
+                            !!(pMemDesc->_flags & MEMDESC_FLAGS_PHYSICALLY_CONTIGUOUS),
+                            pMemDesc->_addressSpace,
+                            pMemDesc->_cpuCacheAttrib,
+@@ -2611,7 +2623,11 @@ memdescCreateSubMem
+         pMemDescNew->PteAdjust = OffsetAdjust & pageArrayGranularityMask;
+ 
+         PageCount = NV_ALIGN_UP64(pMemDescNew->PteAdjust + Size, pageArrayGranularity) >> pageArrayGranularityShift;
+-        memdescFillPages(pMemDescNew, 0, &pMemDesc->_pteArray[PageIndex], PageCount, pageArrayGranularity);
++        if (bNativePageArray)
++            _memdescFillPagesAtNativeGranularity(pMemDescNew, 0,
++                &pMemDesc->_pteArray[PageIndex], PageCount, pageArrayGranularity);
++        else
++            memdescFillPages(pMemDescNew, 0, &pMemDesc->_pteArray[PageIndex], PageCount, pageArrayGranularity);
+     }
+ 
+     if (memdescIsEgm(pMemDesc))

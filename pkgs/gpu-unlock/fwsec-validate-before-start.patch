@@ -1,0 +1,40 @@
+gpu-unlock: validate the FWSEC DMA geometry before firmware_started
+
+falcon_hs() rejects an unloadable geometry only after firmware_started is
+set, so the unwind keeps the card and its DMA buffers until power off and
+nvidia cannot bind it.  Check the same geometry first, and that the
+256-byte-rounded IMEM/DMEM tails stay inside the image.  As in
+Zagitta/gpu-unlock PR #35 and #115 and elias-gaeros/gpu-unlock rtx4090,
+adapted to PR #24, whose falcon_dma_span() already does the rounding.
+After Rahul Sharma (rms523, PR #35) and lerpongn (PR #115).
+Applies after ad10x-four-plm.patch, rooted at kernel/gpu_unlock.
+
+diff --git a/unlock_610.c b/unlock_610.c
+index 5f16687..afc0f2d 100644
+--- a/unlock_610.c
++++ b/unlock_610.c
+@@ -1141,6 +1141,24 @@ static int unlock_transaction_fwsec(struct unlock_transaction_work *work)
+ 			goto out;
+ 		memcpy((u8 *)image + fw.data_off + fw.pkc_off, rom + fw.sig_off + sig_at, 384);
+ 	}
++	/* Check the DMA geometry falcon_hs() checks, before firmware_started: a
++	 * rejection there would keep the card and its DMA buffers until power
++	 * off, and nvidia could not bind it. The DMA moves whole 256-byte blocks,
++	 * so the rounded tails must also stay inside the image. The same fix as
++	 * Zagitta/gpu-unlock PR #35 and #115 and elias-gaeros' rtx4090 branch. */
++	if (image_dma < fw.imem_va ||
++	    falcon_dma_span(fw.imem_size) > fw.image_size ||
++	    (u64)fw.data_off + falcon_dma_span(fw.dmem_size) > fw.image_size ||
++	    !falcon_dma_valid(fw.imem_pa, fw.imem_va, image_dma - fw.imem_va, fw.imem_size) ||
++	    (fw.dmem_size &&
++	     !falcon_dma_valid(fw.dmem_pa, 0, image_dma + fw.data_off, fw.dmem_size))) {
++		dev_err(&work->pdev->dev,
++			"FWSEC DMA geometry rejected before launch: imem=%#x va=%#x pa=%#x data=%#x dmem=%#x pa=%#x image=%#x\n",
++			fw.imem_size, fw.imem_va, fw.imem_pa, fw.data_off, fw.dmem_size,
++			fw.dmem_pa, fw.image_size);
++		ret = -EINVAL;
++		goto out;
++	}
+ 	pci_set_master(work->pdev);
+ 	work->master = true;
+ 	if (diag_pci_word(work, false, PCI_COMMAND, &command) ||

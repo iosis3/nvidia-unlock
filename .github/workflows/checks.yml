@@ -1,0 +1,51 @@
+name: checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: the git ref to check
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    outputs:
+      checks: ${{ steps.list.outputs.checks }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - uses: cachix/install-nix-action@v31
+      - name: format
+        run: nix fmt -- --ci
+      - name: evaluate
+        run: nix flake check --no-build
+      - id: list
+        name: list checks
+        run: echo "checks=$(nix eval --json .#checks.x86_64-linux --apply builtins.attrNames)" >>"$GITHUB_OUTPUT"
+
+  build:
+    needs: eval
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        check: ${{ fromJSON(needs.eval.outputs.checks) }}
+    name: ${{ matrix.check }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - uses: cachix/install-nix-action@v31
+      - run: nix build -L --no-link ".#checks.x86_64-linux.\"$CHECK\""
+        env:
+          CHECK: ${{ matrix.check }}
