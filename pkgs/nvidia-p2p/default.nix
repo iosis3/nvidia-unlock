@@ -29,6 +29,14 @@
       ./p2p-5090-support-580.178.04.patch
     ];
   };
+  "580.196.07" = {
+    mixedGeneration = false;
+    patches = [
+      ./p2p-geohot-580.196.07.patch
+      ./p2p-575-settings-580.196.07.patch
+      ./p2p-5090-support-580.196.07.patch
+    ];
+  };
   "590.48.01" = {
     mixedGeneration = false;
     keep = true;
@@ -59,6 +67,12 @@
     mixedGeneration = false;
     patches = [
       ./p2p-combined-595.104.02.patch
+    ];
+  };
+  "595.112.07" = {
+    mixedGeneration = false;
+    patches = [
+      ./p2p-combined-595.112.07.patch
     ];
   };
   "615.78.08" = {

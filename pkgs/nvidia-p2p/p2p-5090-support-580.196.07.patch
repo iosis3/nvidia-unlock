@@ -1,0 +1,105 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: nimlgen <138685161+nimlgen@users.noreply.github.com>
+Date: Mon, 5 May 2025 19:13:39 +0000
+Subject: [PATCH] 5090 support by nimlgen
+
+---
+ kernel-open/nvidia-uvm/uvm_gpu.h             |  3 ++-
+ src/nvidia/src/kernel/gpu/mem_mgr/mem_desc.c |  3 ++-
+ src/nvidia/src/kernel/mem_mgr/io_vaspace.c   | 20 +++++++++++---------
+ src/nvidia/src/kernel/rmapi/nv_gpu_ops.c     |  9 +++++++--
+ 4 files changed, 22 insertions(+), 13 deletions(-)
+
+diff --git a/kernel-open/nvidia-uvm/uvm_gpu.h b/kernel-open/nvidia-uvm/uvm_gpu.h
+index 491e2ce..0fcf6e3 100644
+--- a/kernel-open/nvidia-uvm/uvm_gpu.h
++++ b/kernel-open/nvidia-uvm/uvm_gpu.h
+@@ -1800,7 +1800,8 @@ NvU64 uvm_parent_gpu_canonical_address(uvm_parent_gpu_t *parent_gpu, NvU64 addr)
+ 
+ static bool uvm_parent_gpu_is_coherent(const uvm_parent_gpu_t *parent_gpu)
+ {
+-    return parent_gpu->system_bus.memory_window_end > parent_gpu->system_bus.memory_window_start;
++    return true;
++    // return parent_gpu->system_bus.memory_window_end > parent_gpu->system_bus.memory_window_start;
+ }
+ 
+ static bool uvm_parent_gpu_supports_ats(const uvm_parent_gpu_t *parent_gpu)
+diff --git a/src/nvidia/src/kernel/gpu/mem_mgr/mem_desc.c b/src/nvidia/src/kernel/gpu/mem_mgr/mem_desc.c
+index bfde6b9..a1b2335 100644
+--- a/src/nvidia/src/kernel/gpu/mem_mgr/mem_desc.c
++++ b/src/nvidia/src/kernel/gpu/mem_mgr/mem_desc.c
+@@ -1517,7 +1517,8 @@ _memdescFreeInternal
+                 }
+                 else
+                 {
+-                    NV_ASSERT_FAILED("Sysmemdesc outlived its attached pGpu");
++                    // TODO: p2p mem?..
++                    // NV_ASSERT_FAILED("Sysmemdesc outlived its attached pGpu");
+                 }
+             }
+ 
+diff --git a/src/nvidia/src/kernel/mem_mgr/io_vaspace.c b/src/nvidia/src/kernel/mem_mgr/io_vaspace.c
+index b8f4f25..fd0517b 100644
+--- a/src/nvidia/src/kernel/mem_mgr/io_vaspace.c
++++ b/src/nvidia/src/kernel/mem_mgr/io_vaspace.c
+@@ -59,14 +59,15 @@ iovaspaceConstruct__IMPL
+ void
+ iovaspaceDestruct_IMPL(OBJIOVASPACE *pIOVAS)
+ {
+-    OBJVASPACE *pVAS = staticCast(pIOVAS, OBJVASPACE);
+-
+-    if (pIOVAS->mappingCount != 0)
+-    {
+-        NV_PRINTF(LEVEL_ERROR, "%lld left-over mappings in IOVAS 0x%x\n",
+-                  pIOVAS->mappingCount, pVAS->vaspaceId);
+-        DBG_BREAKPOINT();
+-    }
++    // OBJVASPACE *pVAS = staticCast(pIOVAS, OBJVASPACE);
++
++    // TODO: might keep p2p mappings...
++    // if (pIOVAS->mappingCount != 0)
++    // {
++    //     NV_PRINTF(LEVEL_ERROR, "%lld left-over mappings in IOVAS 0x%x\n",
++    //               pIOVAS->mappingCount, pVAS->vaspaceId);
++    //     DBG_BREAKPOINT();
++    // }
+ }
+ 
+ NV_STATUS
+@@ -589,7 +590,7 @@ OBJIOVASPACE *iovaspaceFromMapping(PIOVAMAPPING pIovaMapping)
+     // not, the mapping has been left dangling outlasting the IOVAS it was
+     // under.
+     //
+-    NV_ASSERT(pIOVAS != NULL);
++    // NV_ASSERT(pIOVAS != NULL);
+ 
+     return pIOVAS;
+ }
+@@ -598,6 +599,7 @@ void iovaMappingDestroy(PIOVAMAPPING pIovaMapping)
+ {
+     OBJIOVASPACE *pIOVAS = iovaspaceFromMapping(pIovaMapping);
+ 
++    if (pIOVAS == NULL) return;
+     NV_ASSERT_OR_RETURN_VOID(pIOVAS != NULL);
+     iovaspaceDestroyMapping(pIOVAS, pIovaMapping);
+ }
+diff --git a/src/nvidia/src/kernel/rmapi/nv_gpu_ops.c b/src/nvidia/src/kernel/rmapi/nv_gpu_ops.c
+index 644515b..8a1b61e 100644
+--- a/src/nvidia/src/kernel/rmapi/nv_gpu_ops.c
++++ b/src/nvidia/src/kernel/rmapi/nv_gpu_ops.c
+@@ -4040,8 +4040,13 @@ nvGpuOpsBuildExternalAllocPtes
+         NvU32 ptePcfSw  = 0;
+         NvU32 ptePcfHw  = 0;
+ 
+-         nvFieldSetBool(&pPteFmt->fldValid, NV_TRUE, pte.v8);
+-         gmmuFieldSetAperture(&pPteFmt->fldAperture, aperture, pte.v8);
++        nvFieldSetBool(&pPteFmt->fldValid, NV_TRUE, pte.v8);
++        // gmmuFieldSetAperture(&pPteFmt->fldAperture, aperture, pte.v8);
++        if (aperture == GMMU_APERTURE_PEER) {
++            gmmuFieldSetAperture(&pPteFmt->fldAperture, GMMU_APERTURE_SYS_COH, pte.v8);
++        } else {
++            gmmuFieldSetAperture(&pPteFmt->fldAperture, aperture, pte.v8);
++        }
+          nvFieldSet32(&pPteFmt->fldKind, kind, pte.v8);
+ 
+          ptePcfSw |= vol         ? (1 << SW_MMU_PCF_UNCACHED_IDX) : 0;
